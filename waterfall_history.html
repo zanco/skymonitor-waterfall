@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Skymonitor history</title>
+<style>
+  :root { --bg:#111418; --bar:#1c2128; --fg:#d8dde3; --dim:#8a939e; --btn:#2a313a; --btnh:#38414c; --acc:#4da3ff; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+               font:13px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow:hidden; }
+  body { display:flex; flex-direction:column; }
+  header { background:var(--bar); padding:6px 10px; display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; }
+  header h1 { font-size:14px; margin:0; font-weight:600; white-space:nowrap; }
+  .grp { display:flex; align-items:center; gap:6px; white-space:nowrap; }
+  .grp label { color:var(--dim); }
+  input[type=range] { width:150px; accent-color:var(--acc); }
+  input[type=number] { width:58px; background:var(--btn); color:var(--fg); border:0; border-radius:4px; padding:3px 4px; font:inherit; }
+  select, button { background:var(--btn); color:var(--fg); border:0; border-radius:6px; padding:5px 9px; font:inherit; cursor:pointer; }
+  button:hover, select:hover { background:var(--btnh); }
+  #readout { color:var(--fg); font-variant-numeric:tabular-nums; min-width:16em; }
+  #info { color:var(--dim); font-size:12px; margin-left:auto; }
+  #wrap { position:relative; flex:1; min-height:0; }
+  #cv { position:absolute; inset:0; width:100%; height:100%; touch-action:none; cursor:crosshair; }
+  #msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--dim);
+         text-align:center; padding:20px; }
+  @media (max-width:640px) { input[type=range] { width:110px; } #readout { min-width:0; } }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Skymonitor</h1>
+  <div class="grp"><label for="cmin">CMIN</label><input id="cmin" type="range"><input id="cminN" type="number" step="0.5"></div>
+  <div class="grp"><label for="cmax">CMAX</label><input id="cmax" type="range"><input id="cmaxN" type="number" step="0.5"></div>
+  <div class="grp">
+    <select id="span" title="How much history to load">
+      <option value="8">8 h</option><option value="24">24 h</option>
+      <option value="48">2 days</option><option value="72">3 days</option>
+    </select>
+    <select id="pool" title="When zoomed out, several rows/bins share one pixel: show their peak (keeps narrow signals) or their mean (shows the noise floor)">
+      <option value="max">peak</option><option value="mean">mean</option>
+    </select>
+    <select id="cmap" title="Colour map">
+      <option value="jet">jet</option><option value="viridis">viridis</option>
+      <option value="inferno">inferno</option><option value="gray">grey</option>
+    </select>
+    <button id="auto" title="Levels from the data: noise floor − 4 dB … 99.9% + 2 dB">Auto</button>
+    <button id="fit" title="Show everything (double-click / double-tap)">Fit</button>
+    <button id="reload" title="Load the latest data now">Reload</button>
+  </div>
+  <span id="readout"></span>
+  <span id="info">loading…</span>
+</header>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="msg">Loading data…</div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var INDEX_URL = "skymon_index.json", TILE_DIR = "tiles/";   // same folder as this page
+  var REFRESH_MS = 5 * 60 * 1000;
+  var SPEC_H = 110, AX_L = 64, AX_B = 22, GAP = 18, PAD_R = 10, PAD_T = 6;
+
+  var cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+  var wrap = document.getElementById("wrap"), msg = document.getElementById("msg");
+  var info = document.getElementById("info"), readout = document.getElementById("readout");
+  var el = function (id) { return document.getElementById(id); };
+
+  var meta = null, grey = null, cols = 0, rows = 0;   // grey: Uint8Array rows*cols, newest row first
+  var tiles = new Map();                              // png name -> decoded hour tile
+  var dayBreaks = [];                                 // row indices where the date changes
+  var cmin = -39, cmax = -11, cmapName = "jet", spanH = 72, poolMode = "max";
+  var sx = 1, sy = 1, tx = 0, ty = 0, fitted = true;    // data px -> waterfall px
+  var hover = null, dpr = 1, W = 0, H = 0, raf = 0;
+
+  // ---------- storage (per-viewer convenience only) ----------
+  function sget(k) { try { return localStorage.getItem("skymon_" + k); } catch (e) { return null; } }
+  function sset(k, v) { try { localStorage.setItem("skymon_" + k, v); } catch (e) {} }
+
+  // ---------- colour maps ----------
+  var CMAPS = {
+    jet: [[0,0,0,.5],[.11,0,0,1],[.125,0,0,1],[.34,0,1,1],[.375,0,1,1],[.64,1,1,0],[.66,1,1,0],[.89,1,0,0],[1,.5,0,0]],
+    viridis: [[0,.267,.005,.329],[.125,.283,.141,.458],[.25,.254,.265,.530],[.375,.207,.372,.553],[.5,.164,.471,.558],
+              [.625,.128,.567,.551],[.75,.135,.659,.518],[.875,.478,.821,.318],[1,.993,.906,.144]],
+    inferno: [[0,.001,0,.014],[.125,.088,.042,.244],[.25,.258,.039,.406],[.375,.416,.090,.433],[.5,.578,.148,.404],
+              [.625,.736,.216,.330],[.75,.865,.317,.226],[.875,.966,.513,.063],[1,.988,.998,.645]],
+    gray: [[0,0,0,0],[1,1,1,1]]
+  };
+  function cmapRGB(name, t) {
+    var p = CMAPS[name] || CMAPS.jet;
+    if (t <= p[0][0]) return [p[0][1], p[0][2], p[0][3]];
+    for (var i = 1; i < p.length; i++) {
+      if (t <= p[i][0]) {
+        var a = p[i - 1], b = p[i], f = (t - a[0]) / ((b[0] - a[0]) || 1);
+        return [a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, a[3] + (b[3] - a[3]) * f];
+      }
+    }
+    var l = p[p.length - 1]; return [l[1], l[2], l[3]];
+  }
+
+  // ---------- colour lookup table ----------
+  var curLut = null;
+  function recolour() {
+    if (!grey) return;
+    var lut = new Uint32Array(256), span = (cmax - cmin) || 1;
+    var little = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+    for (var v = 0; v < 256; v++) {
+      var db = meta.db_offset + v * meta.db_step;
+      var t = Math.max(0, Math.min(1, (db - cmin) / span));
+      var c = cmapRGB(cmapName, t), r = Math.round(c[0] * 255), g = Math.round(c[1] * 255), b = Math.round(c[2] * 255);
+      lut[v] = little ? ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0 : ((r << 24) | (g << 16) | (b << 8) | 255) >>> 0;
+    }
+    curLut = lut; cache = null;
+    draw();
+  }
+
+  // Three days at full resolution is ~26 million pixels: too big for one canvas
+  // on phones. So only the visible part (plus half a screen around it) is
+  // rendered, max-pooled to roughly screen resolution so narrow signals survive
+  // zooming out. While zooming/panning the old render is stretched and a new
+  // one is made shortly after the movement stops.
+  var cache = null, rebuildT = 0;
+  function factors() {
+    return { fx: sx >= 0.95 ? 1 : Math.ceil(1 / sx), fy: sy >= 0.95 ? 1 : Math.ceil(1 / sy) };
+  }
+  function visibleData() {
+    var r = wfRect();
+    return { c0: -tx / sx, c1: (r.w - tx) / sx, r0: -ty / sy, r1: (r.h - ty) / sy };
+  }
+  function covers(c, v) {
+    return Math.max(0, Math.floor(v.c0)) >= c.c0 && Math.min(cols, Math.ceil(v.c1)) <= c.c1 &&
+           Math.max(0, Math.floor(v.r0)) >= c.r0 && Math.min(rows, Math.ceil(v.r1)) <= c.r1;
+  }
+  function buildCache(f) {
+    cache = null;
+    if (!grey || !curLut) return;
+    var v = visibleData(), mc = (v.c1 - v.c0) / 2, mr = (v.r1 - v.r0) / 2, fx = f.fx, fy = f.fy;
+    var c0 = Math.max(0, Math.floor((v.c0 - mc) / fx) * fx), c1 = Math.min(cols, Math.ceil(v.c1 + mc));
+    var r0 = Math.max(0, Math.floor((v.r0 - mr) / fy) * fy), r1 = Math.min(rows, Math.ceil(v.r1 + mr));
+    if (c1 <= c0 || r1 <= r0) return;
+    var pw = Math.ceil((c1 - c0) / fx), ph = Math.ceil((r1 - r0) / fy), nc = c1 - c0;
+    var c = document.createElement("canvas"); c.width = pw; c.height = ph;
+    var cx = c.getContext("2d"), img = cx.createImageData(pw, ph), out = new Uint32Array(img.data.buffer);
+    var o = 0, k, px, rr, base;
+    if (poolMode === "mean" && (fx > 1 || fy > 1)) {
+      var sum = new Uint32Array(nc);
+      for (var py = 0; py < ph; py++) {
+        var ra = r0 + py * fy, rb = Math.min(r1, ra + fy);
+        sum.fill(0);
+        for (rr = ra; rr < rb; rr++) { base = rr * cols + c0; for (k = 0; k < nc; k++) sum[k] += grey[base + k]; }
+        for (px = 0; px < pw; px++) {
+          var ka = px * fx, kb = Math.min(nc, ka + fx), s2 = 0;
+          for (k = ka; k < kb; k++) s2 += sum[k];
+          out[o++] = curLut[Math.round(s2 / ((kb - ka) * (rb - ra)))];
+        }
+      }
+    } else {
+      var tmp = new Uint8Array(nc);
+      for (py = 0; py < ph; py++) {
+        ra = r0 + py * fy; rb = Math.min(r1, ra + fy);
+        tmp.set(grey.subarray(ra * cols + c0, ra * cols + c1));
+        for (rr = ra + 1; rr < rb; rr++) {
+          base = rr * cols + c0;
+          for (k = 0; k < nc; k++) { var g = grey[base + k]; if (g > tmp[k]) tmp[k] = g; }
+        }
+        if (fx === 1) { for (k = 0; k < nc; k++) out[o++] = curLut[tmp[k]]; }
+        else {
+          for (px = 0; px < pw; px++) {
+            ka = px * fx; kb = Math.min(nc, ka + fx); var m = 0;
+            for (k = ka; k < kb; k++) if (tmp[k] > m) m = tmp[k];
+            out[o++] = curLut[m];
+          }
+        }
+      }
+    }
+    cx.putImageData(img, 0, 0);
+    cache = { c: c, fx: fx, fy: fy, c0: c0, c1: c1, r0: r0, r1: r1 };
+  }
+
+  // ---------- geometry ----------
+  function wfRect() { return { x: AX_L, y: PAD_T + SPEC_H + GAP, w: W - AX_L - PAD_R, h: H - (PAD_T + SPEC_H + GAP) - AX_B }; }
+  function specRect() { return { x: AX_L, y: PAD_T, w: W - AX_L - PAD_R, h: SPEC_H }; }
+
+  function fit() {
+    if (!grey) return;
+    var r = wfRect();
+    sx = r.w / cols; sy = r.h / rows; tx = 0; ty = 0; fitted = true; draw();
+  }
+  function clampView() {
+    var r = wfRect();
+    var minSx = r.w / cols * 0.5, minSy = r.h / rows * 0.5;
+    sx = Math.max(minSx, Math.min(sx, 40)); sy = Math.max(minSy, Math.min(sy, 40));
+  }
+  function zoomAt(fx, fy, px, py) {         // px,py in waterfall-local px
+    var osx = sx, osy = sy;
+    sx = sx * fx; sy = sy * fy; clampView();
+    tx = px - (px - tx) * (sx / osx); ty = py - (py - ty) * (sy / osy);
+    fitted = false; draw();
+  }
+
+  function freqAtCol(c) { return meta.freq_lo_hz + (c + 0.5) * (meta.freq_hi_hz - meta.freq_lo_hz) / cols; }
+  function colAtFreq(f) { return (f - meta.freq_lo_hz) / (meta.freq_hi_hz - meta.freq_lo_hz) * cols; }
+
+  // ---------- drawing ----------
+  function draw() { if (!raf) raf = requestAnimationFrame(function () { raf = 0; paint(); }); }
+
+  function niceStep(span, target) {
+    var raw = span / target, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p;
+    return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+  }
+
+  function paint() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#111418"; ctx.fillRect(0, 0, W, H);
+    if (!grey) return;
+    var r = wfRect(), s = specRect();
+
+    // waterfall
+    var f = factors(), vis = visibleData();
+    if (!cache) buildCache(f);
+    else if (cache.fx !== f.fx || cache.fy !== f.fy || !covers(cache, vis)) {
+      clearTimeout(rebuildT);
+      rebuildT = setTimeout(function () { buildCache(factors()); draw(); }, 120);
+    }
+    ctx.save(); ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+    if (cache) {
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(cache.c, r.x + tx + cache.c0 * sx, r.y + ty + cache.r0 * sy,
+                    cache.c.width * cache.fx * sx, cache.c.height * cache.fy * sy);
+    }
+    // midnight lines (black with white dashes: visible on any colour map)
+    ctx.lineWidth = 1;
+    dayBreaks.forEach(function (row) {
+      var y = Math.round(r.y + ty + row * sy) + .5;
+      if (y <= r.y || y >= r.y + r.h) return;
+      ctx.setLineDash([]); ctx.strokeStyle = "rgba(0,0,0,.8)";
+      ctx.beginPath(); ctx.moveTo(r.x, y); ctx.lineTo(r.x + r.w, y); ctx.stroke();
+      ctx.setLineDash([6, 6]); ctx.strokeStyle = "rgba(255,255,255,.9)"; ctx.stroke();
+    });
+    ctx.setLineDash([]);
+    ctx.restore();
+    ctx.strokeStyle = "#3a434e"; ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + .5, r.y + .5, r.w - 1, r.h - 1);
+
+    // visible columns / rows
+    var c0 = Math.max(0, Math.floor(-tx / sx)), c1 = Math.min(cols - 1, Math.ceil((r.w - tx) / sx));
+    var r0 = Math.max(0, Math.floor(-ty / sy)), r1 = Math.min(rows - 1, Math.ceil((r.h - ty) / sy));
+
+    // frequency axis (shared)
+    ctx.fillStyle = "#c5ccd4"; ctx.font = "11px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+    var fL = freqAtCol(-tx / sx - 0.5), fR = freqAtCol((r.w - tx) / sx - 0.5);
+    var st = niceStep((fR - fL) / 1e6, Math.max(2, r.w / 90)) * 1e6, dec = Math.max(0, -Math.floor(Math.log10(st / 1e6) + 1e-9));
+    for (var fq = Math.ceil(fL / st) * st; fq <= fR; fq += st) {
+      var x = r.x + tx + colAtFreq(fq) * sx;
+      if (x < r.x || x > r.x + r.w) continue;
+      if (x < r.x + r.w - 40) { ctx.fillText((fq / 1e6).toFixed(dec), x, r.y + r.h + 4);      // bottom axis
+        ctx.fillText((fq / 1e6).toFixed(dec), x, s.y + s.h + 3); }   // top axis, between spectrum and waterfall
+      ctx.strokeStyle = "rgba(255,255,255,.08)";
+      ctx.beginPath(); ctx.moveTo(x + .5, s.y); ctx.lineTo(x + .5, s.y + s.h); ctx.stroke();
+    }
+    ctx.textAlign = "right"; ctx.fillStyle = "#8a939e"; ctx.fillText("MHz", W - PAD_R, r.y + r.h + 4);
+
+    // time axis (date shown under the first label and wherever the day changes)
+    ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillStyle = "#c5ccd4";
+    var every = Math.max(1, Math.round(28 / sy)), lastY = -1e9, lastDay = "";
+    var rStart = Math.ceil(r0 / every) * every;
+    for (var row = rStart; row <= r1; row += every) {
+      var y = r.y + ty + (row + 0.5) * sy;
+      if (y < r.y + 6 || y > r.y + r.h - 6 || y - lastY < 24) continue;
+      var t = meta.times[row] || "", tn = meta.times[Math.min(rows - 1, row + every)] || t;
+      var gapS = Math.abs((Date.parse(t) - Date.parse(tn)) / 1000) || 60;
+      ctx.fillText(gapS < 60 ? t.slice(11, 19) : t.slice(11, 16), r.x - 6, y);
+      var d = t.slice(0, 10);
+      if (d !== lastDay) {
+        ctx.fillStyle = "#8a939e"; ctx.fillText(d.slice(8, 10) + "/" + d.slice(5, 7), r.x - 6, y + 12); ctx.fillStyle = "#c5ccd4";
+        lastDay = d;
+      }
+      lastY = y;
+    }
+
+    // spectrum panel: mean over visible rows (+ hovered row)
+    ctx.strokeStyle = "#3a434e"; ctx.strokeRect(s.x + .5, s.y + .5, s.w - 1, s.h - 1);
+    var nC = c1 - c0 + 1;
+    if (nC > 1 && r1 >= r0) {
+      var mean = new Float32Array(nC), cnt = 0, stepR = Math.max(1, Math.ceil((r1 - r0 + 1) / 1500));
+      for (var rr = r0; rr <= r1; rr += stepR) { var base = rr * cols + c0; for (var k = 0; k < nC; k++) mean[k] += grey[base + k]; cnt++; }
+      var lo = 1e9, hi = -1e9;
+      for (k = 0; k < nC; k++) { mean[k] = meta.db_offset + mean[k] / cnt * meta.db_step; if (mean[k] < lo) lo = mean[k]; if (mean[k] > hi) hi = mean[k]; }
+      var hrow = null;
+      if (hover && hover.row >= 0 && hover.row < rows) {
+        hrow = new Float32Array(nC); var hb = hover.row * cols + c0;
+        for (k = 0; k < nC; k++) { hrow[k] = meta.db_offset + grey[hb + k] * meta.db_step; if (hrow[k] > hi) hi = hrow[k]; if (hrow[k] < lo) lo = hrow[k]; }
+      }
+      lo = Math.min(lo, cmin); hi = Math.max(hi, cmax) + 2;
+      var ys = function (db) { return s.y + s.h - 4 - (db - lo) / (hi - lo) * (s.h - 8); };
+      var line = function (arr, col) {
+        ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.beginPath();
+        for (var k2 = 0; k2 < nC; k2++) { var xx = s.x + tx + (c0 + k2 + 0.5) * sx, yy = ys(arr[k2]); if (k2) ctx.lineTo(xx, yy); else ctx.moveTo(xx, yy); }
+        ctx.stroke();
+      };
+      ctx.save(); ctx.beginPath(); ctx.rect(s.x, s.y, s.w, s.h); ctx.clip();
+      ctx.setLineDash([3, 3]); ctx.strokeStyle = "rgba(255,255,255,.25)";
+      [cmin, cmax].forEach(function (lv) { var yy = ys(lv) + .5; ctx.beginPath(); ctx.moveTo(s.x, yy); ctx.lineTo(s.x + s.w, yy); ctx.stroke(); });
+      ctx.setLineDash([]);
+      line(mean, "#4da3ff");
+      if (hrow) line(hrow, "#ffb347");
+      ctx.restore();
+      ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillStyle = "#8a939e";
+      var dst = niceStep(hi - lo, 4);
+      for (var lv = Math.ceil(lo / dst) * dst; lv <= hi; lv += dst) ctx.fillText(lv.toFixed(0), s.x - 6, ys(lv));
+      ctx.save(); ctx.translate(12, s.y + s.h / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = "center";
+      ctx.fillText("dB", 0, 0); ctx.restore();
+      ctx.textAlign = "left"; ctx.textBaseline = "top"; ctx.fillStyle = "#4da3ff";
+      ctx.fillText("mean of visible rows", s.x + 6, s.y + 4);
+      if (hrow) { ctx.fillStyle = "#ffb347"; ctx.fillText("row " + (meta.times[hover.row] || "").slice(11, 19), s.x + 140, s.y + 4); }
+    }
+
+    // crosshair
+    if (hover && hover.inWf) {
+      ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(hover.x + .5, s.y); ctx.lineTo(hover.x + .5, r.y + r.h);
+      ctx.moveTo(r.x, hover.y + .5); ctx.lineTo(r.x + r.w, hover.y + .5); ctx.stroke();
+    }
+  }
+
+  // ---------- hover readout ----------
+  function updateHover(clientX, clientY) {
+    if (!grey) return;
+    var b = cv.getBoundingClientRect(), x = clientX - b.left, y = clientY - b.top, r = wfRect();
+    var inWf = x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+    var inSpec = x >= r.x && x <= r.x + r.w && y >= PAD_T && y <= PAD_T + SPEC_H;
+    if (!inWf && !inSpec) { hover = null; readout.textContent = ""; draw(); return; }
+    var col = Math.floor((x - r.x - tx) / sx), row = inWf ? Math.floor((y - r.y - ty) / sy) : (hover ? hover.row : -1);
+    hover = { x: x, y: y, col: col, row: row, inWf: inWf };
+    if (col >= 0 && col < cols) {
+      var txt = (freqAtCol(col) / 1e6).toFixed(4) + " MHz";
+      if (inWf && row >= 0 && row < rows) {
+        var db = meta.db_offset + grey[row * cols + col] * meta.db_step;
+        txt += "  ·  " + (meta.times[row] || "").replace("T", " ") + "  ·  " + db.toFixed(1) + " dB";
+      }
+      readout.textContent = txt;
+    } else readout.textContent = "";
+    draw();
+  }
+
+  // ---------- controls ----------
+  function setLevels(a, b, save) {
+    cmin = Math.min(a, b - 0.5); cmax = Math.max(b, cmin + 0.5);
+    el("cmin").value = cmin; el("cminN").value = cmin.toFixed(1);
+    el("cmax").value = cmax; el("cmaxN").value = cmax.toFixed(1);
+    if (save) { sset("cmin", cmin); sset("cmax", cmax); }
+    recolour();
+  }
+  function setupRanges() {
+    var lo = Math.floor(meta.db_offset), hi = Math.ceil(meta.db_offset + 255 * meta.db_step);
+    ["cmin", "cmax"].forEach(function (id) { var s = el(id); s.min = lo; s.max = hi; s.step = 0.5; el(id + "N").min = lo; el(id + "N").max = hi; });
+  }
+  el("cmin").addEventListener("input", function () { setLevels(+this.value, cmax, true); });
+  el("cmax").addEventListener("input", function () { setLevels(cmin, +this.value, true); });
+  el("cminN").addEventListener("change", function () { setLevels(+this.value, cmax, true); });
+  el("cmaxN").addEventListener("change", function () { setLevels(cmin, +this.value, true); });
+  el("cmap").addEventListener("change", function () { cmapName = this.value; sset("cmap", cmapName); recolour(); });
+  el("pool").addEventListener("change", function () { poolMode = this.value; sset("pool", poolMode); cache = null; draw(); });
+  el("span").addEventListener("change", function () { spanH = +this.value; sset("span", spanH); fitted = true; load(true); });
+  el("auto").onclick = function () { setLevels(meta.default_cmin, meta.default_cmax, true); };
+  el("fit").onclick = fit;
+  el("reload").onclick = function () { load(true); };
+
+  // ---------- pointer: pan, wheel zoom, pinch, double-tap ----------
+  var pointers = new Map(), last = null, pinch = null, lastTap = 0;
+  cv.addEventListener("wheel", function (e) {
+    e.preventDefault(); if (!grey) return;
+    var b = cv.getBoundingClientRect(), r = wfRect(), f = Math.exp(-e.deltaY * 0.0015);
+    var px = e.clientX - b.left - r.x, py = e.clientY - b.top - r.y;
+    if (e.shiftKey) zoomAt(f, 1, px, py);        // frequency only
+    else if (e.altKey) zoomAt(1, f, px, py);     // time only
+    else zoomAt(f, f, px, py);
+    updateHover(e.clientX, e.clientY);
+  }, { passive: false });
+  cv.addEventListener("pointerdown", function (e) {
+    cv.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) {
+      last = { x: e.clientX, y: e.clientY };
+      var now = Date.now();
+      if (now - lastTap < 300) { fit(); lastTap = 0; } else lastTap = now;
+    } else if (pointers.size === 2) {
+      var p = Array.from(pointers.values());
+      pinch = { dx: Math.abs(p[0].x - p[1].x), dy: Math.abs(p[0].y - p[1].y), cx: (p[0].x + p[1].x) / 2, cy: (p[0].y + p[1].y) / 2 };
+    }
+  });
+  cv.addEventListener("pointermove", function (e) {
+    if (e.pointerType === "mouse" && pointers.size === 0) { updateHover(e.clientX, e.clientY); return; }
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    var b = cv.getBoundingClientRect(), r = wfRect();
+    if (pointers.size === 2 && pinch) {
+      var p = Array.from(pointers.values());
+      var dx = Math.abs(p[0].x - p[1].x), dy = Math.abs(p[0].y - p[1].y), cx = (p[0].x + p[1].x) / 2, cy = (p[0].y + p[1].y) / 2;
+      tx += cx - pinch.cx; ty += cy - pinch.cy;
+      var d0 = Math.hypot(pinch.dx, pinch.dy), d1 = Math.hypot(dx, dy);
+      if (d0 > 10) zoomAt(d1 / d0, d1 / d0, cx - b.left - r.x, cy - b.top - r.y);
+      pinch = { dx: dx, dy: dy, cx: cx, cy: cy }; fitted = false; draw();
+    } else if (pointers.size === 1 && last) {
+      tx += e.clientX - last.x; ty += e.clientY - last.y; last = { x: e.clientX, y: e.clientY };
+      fitted = false; updateHover(e.clientX, e.clientY);
+    }
+  });
+  function up(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 1) { var p = Array.from(pointers.values())[0]; last = { x: p.x, y: p.y }; }
+    if (pointers.size === 0) last = null;
+  }
+  cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
+  cv.addEventListener("pointerleave", function () { if (pointers.size === 0) { hover = null; readout.textContent = ""; draw(); } });
+  document.addEventListener("keydown", function (e) {
+    if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+    var r = wfRect();
+    if (e.key === "f" || e.key === "0") fit();
+    else if (e.key === "+" || e.key === "=") zoomAt(1.25, 1.25, r.w / 2, r.h / 2);
+    else if (e.key === "-") zoomAt(0.8, 0.8, r.w / 2, r.h / 2);
+    else if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "PageUp" || e.key === "PageDown") {
+      var d = (e.key.indexOf("Page") === 0 ? 0.9 : 0.25) * r.h;
+      ty += (e.key === "ArrowUp" || e.key === "PageUp") ? d : -d;   // up = newer, down = older
+      fitted = false; e.preventDefault(); draw();
+    }
+  });
+
+  // ---------- size ----------
+  function resize() {
+    dpr = window.devicePixelRatio || 1; W = wrap.clientWidth; H = wrap.clientHeight;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    cache = null;
+    if (fitted) fit(); else draw();
+  }
+  window.addEventListener("resize", resize);
+
+  // ---------- loading: index + one PNG per hour ----------
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  function rowTimes(t0, dt) {          // station wall-clock strings, done in UTC so the viewer's zone doesn't matter
+    var b = Date.parse(t0 + "Z"), out = new Array(dt.length);
+    for (var i = 0; i < dt.length; i++) {
+      var d = new Date(b + dt[i] * 1000);
+      out[i] = d.getUTCFullYear() + "-" + pad(d.getUTCMonth() + 1) + "-" + pad(d.getUTCDate()) + "T" +
+               pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes()) + ":" + pad(d.getUTCSeconds());
+    }
+    return out;
+  }
+  function loadTile(e) {
+    var have = tiles.get(e.png);
+    if (have && have.gen === e.gen) return Promise.resolve(have);
+    return new Promise(function (res) {
+      var im = new Image();
+      im.onload = function () {
+        var c = document.createElement("canvas"); c.width = im.naturalWidth; c.height = im.naturalHeight;
+        var cx = c.getContext("2d", { willReadFrequently: true }); cx.drawImage(im, 0, 0);
+        var d = cx.getImageData(0, 0, c.width, c.height).data, g = new Uint8Array(c.width * c.height);
+        for (var i = 0, j = 0; i < g.length; i++, j += 4) g[i] = d[j];
+        var t = { gen: e.gen, grey: g, w: c.width, rows: c.height, times: rowTimes(e.t0, e.dt) };
+        tiles.set(e.png, t); res(t);
+      };
+      im.onerror = function () { res(null); };          // missing tile: leave it out
+      im.src = TILE_DIR + e.png + "?g=" + encodeURIComponent(e.gen);
+    });
+  }
+
+  function assemble(ix, want, got) {
+    var keep = {}; want.forEach(function (e) { keep[e.png] = 1; });
+    Array.from(tiles.keys()).forEach(function (k) { if (!keep[k]) tiles.delete(k); });
+    var parts = [], total = 0;
+    got.forEach(function (t) {
+      if (!t || t.w !== ix.cols) return;
+      var n = Math.min(t.rows, t.times.length); parts.push([t, n]); total += n;
+    });
+    if (!total) throw new Error("no tiles could be loaded");
+    var g = new Uint8Array(total * ix.cols), times = [], o = 0;
+    parts.forEach(function (p) {
+      g.set(p[0].grey.subarray(0, p[1] * ix.cols), o); o += p[1] * ix.cols;
+      Array.prototype.push.apply(times, p[0].times.slice(0, p[1]));
+    });
+    var first = !meta, prevNewest = meta ? meta.times[0] : null;
+    meta = { station: ix.station, freq_lo_hz: ix.freq_lo_hz, freq_hi_hz: ix.freq_hi_hz,
+             db_offset: ix.db_offset, db_step: ix.db_step, default_cmin: ix.default_cmin, default_cmax: ix.default_cmax,
+             times: times, generated: ix.generated, hours: parts.length, missing: want.length - parts.length };
+    grey = g; cols = ix.cols; rows = total;
+    dayBreaks = [];
+    for (var i = 1; i < rows; i++) if (times[i].slice(0, 10) !== times[i - 1].slice(0, 10)) dayBreaks.push(i);
+    // new rows arrive on top: keep looking at the same moment when zoomed in
+    if (!first && !fitted && prevNewest) { var idx = times.indexOf(prevNewest); if (idx > 0) ty -= idx * sy; }
+    el("title").textContent = (ix.station || "Skymonitor") + " skymonitor";
+    setupRanges();
+    if (first) {
+      var sc = parseFloat(sget("cmin")), sm = parseFloat(sget("cmax")), cm = sget("cmap");
+      if (cm && CMAPS[cm]) { cmapName = cm; el("cmap").value = cm; }
+      msg.style.display = "none";
+      setLevels(isFinite(sc) ? sc : ix.default_cmin, isFinite(sm) ? sm : ix.default_cmax, false);
+      resize();
+    } else { recolour(); if (fitted) fit(); }
+  }
+
+  var loading = false;
+  function load(manual) {
+    if (loading) return;
+    loading = true;
+    fetch(INDEX_URL + "?t=" + Date.now(), { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (ix) {
+        if (meta && !manual && ix.generated === meta.generated) return;
+        var list = ix.tiles || [];
+        if (!list.length) throw new Error("index has no tiles");
+        var from = Date.parse(list[0].t0 + "Z") - (spanH - 1) * 3600e3;
+        var want = list.filter(function (e) { return Date.parse(e.t0 + "Z") >= from; });
+        info.textContent = "loading " + want.length + " h…";
+        return Promise.all(want.map(loadTile)).then(function (got) { assemble(ix, want, got); });
+      })
+      .then(stamp)
+      .catch(function (err) {
+        if (!meta) { msg.innerHTML = "No history data found (" + INDEX_URL + ": " + err.message + ").<br>" +
+                     "<a style='color:#4da3ff' href='waterfall.html'>Open the 8-hour waterfall</a>"; }
+        info.textContent = "update failed, retrying later";
+      })
+      .then(function () { loading = false; });
+  }
+  function stamp() {
+    var g = meta && meta.times.length ? meta.times[0].replace("T", " ").slice(5, 16) : "";
+    info.textContent = "data up to " + g + " · " + meta.hours + " h" + (meta.missing ? " (" + meta.missing + " missing)" : "") +
+      " · checked " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  var ss = parseFloat(sget("span"));
+  if ([8, 24, 48, 72].indexOf(ss) >= 0) spanH = ss;
+  el("span").value = String(spanH);
+  if (sget("pool") === "mean") { poolMode = "mean"; el("pool").value = "mean"; }
+  resize(); load(false); setInterval(function () { load(false); }, REFRESH_MS);
+})();
+</script>
+</body>
+</html>

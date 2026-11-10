@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Skymonitor waterfall</title>
+<style>
+  :root { --bg:#111418; --bar:#1c2128; --fg:#d8dde3; --dim:#8a939e; --btn:#2a313a; --btnh:#38414c; --acc:#4da3ff; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+               font:13px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow:hidden; }
+  body { display:flex; flex-direction:column; }
+  header { background:var(--bar); padding:6px 10px; display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; }
+  header h1 { font-size:14px; margin:0; font-weight:600; white-space:nowrap; }
+  .grp { display:flex; align-items:center; gap:6px; white-space:nowrap; }
+  .grp label { color:var(--dim); }
+  input[type=range] { width:150px; accent-color:var(--acc); }
+  input[type=number] { width:58px; background:var(--btn); color:var(--fg); border:0; border-radius:4px; padding:3px 4px; font:inherit; }
+  select, button { background:var(--btn); color:var(--fg); border:0; border-radius:6px; padding:5px 9px; font:inherit; cursor:pointer; }
+  button:hover, select:hover { background:var(--btnh); }
+  #readout { color:var(--fg); font-variant-numeric:tabular-nums; min-width:16em; }
+  #info { color:var(--dim); font-size:12px; margin-left:auto; }
+  #wrap { position:relative; flex:1; min-height:0; }
+  #cv { position:absolute; inset:0; width:100%; height:100%; touch-action:none; cursor:crosshair; }
+  #msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--dim);
+         text-align:center; padding:20px; }
+  @media (max-width:640px) { input[type=range] { width:110px; } #readout { min-width:0; } }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Skymonitor</h1>
+  <div class="grp"><label for="cmin">CMIN</label><input id="cmin" type="range"><input id="cminN" type="number" step="0.5"></div>
+  <div class="grp"><label for="cmax">CMAX</label><input id="cmax" type="range"><input id="cmaxN" type="number" step="0.5"></div>
+  <div class="grp">
+    <select id="cmap" title="Colour map">
+      <option value="jet">jet</option><option value="viridis">viridis</option>
+      <option value="inferno">inferno</option><option value="gray">grey</option>
+    </select>
+    <button id="auto" title="Levels from the data: noise floor − 4 dB … 99.9% + 2 dB">Auto</button>
+    <button id="fit" title="Show everything (double-click / double-tap)">Fit</button>
+    <button id="reload" title="Load the latest data now">Reload</button>
+  </div>
+  <span id="readout"></span>
+  <span id="info">loading…</span>
+</header>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="msg">Loading data…</div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var META_URL = "rtl_power_data.json";    // same folder as this page
+  var REFRESH_MS = 5 * 60 * 1000;
+  var SPEC_H = 110, AX_L = 64, AX_B = 22, GAP = 18, PAD_R = 10, PAD_T = 6;
+
+  var cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+  var wrap = document.getElementById("wrap"), msg = document.getElementById("msg");
+  var info = document.getElementById("info"), readout = document.getElementById("readout");
+  var el = function (id) { return document.getElementById(id); };
+
+  var meta = null, grey = null, cols = 0, rows = 0;   // grey: Uint8Array rows*cols
+  var off = document.createElement("canvas"), offCtx = off.getContext("2d");
+  var cmin = -39, cmax = -11, cmapName = "jet";
+  var sx = 1, sy = 1, tx = 0, ty = 0, fitted = true;    // image px -> waterfall px
+  var hover = null, dpr = 1, W = 0, H = 0, raf = 0;
+
+  // ---------- storage (per-viewer convenience only) ----------
+  function sget(k) { try { return localStorage.getItem("skymon_" + k); } catch (e) { return null; } }
+  function sset(k, v) { try { localStorage.setItem("skymon_" + k, v); } catch (e) {} }
+
+  // ---------- colour maps ----------
+  var CMAPS = {
+    jet: [[0,0,0,.5],[.11,0,0,1],[.125,0,0,1],[.34,0,1,1],[.375,0,1,1],[.64,1,1,0],[.66,1,1,0],[.89,1,0,0],[1,.5,0,0]],
+    viridis: [[0,.267,.005,.329],[.125,.283,.141,.458],[.25,.254,.265,.530],[.375,.207,.372,.553],[.5,.164,.471,.558],
+              [.625,.128,.567,.551],[.75,.135,.659,.518],[.875,.478,.821,.318],[1,.993,.906,.144]],
+    inferno: [[0,.001,0,.014],[.125,.088,.042,.244],[.25,.258,.039,.406],[.375,.416,.090,.433],[.5,.578,.148,.404],
+              [.625,.736,.216,.330],[.75,.865,.317,.226],[.875,.966,.513,.063],[1,.988,.998,.645]],
+    gray: [[0,0,0,0],[1,1,1,1]]
+  };
+  function cmapRGB(name, t) {
+    var p = CMAPS[name] || CMAPS.jet;
+    if (t <= p[0][0]) return [p[0][1], p[0][2], p[0][3]];
+    for (var i = 1; i < p.length; i++) {
+      if (t <= p[i][0]) {
+        var a = p[i - 1], b = p[i], f = (t - a[0]) / ((b[0] - a[0]) || 1);
+        return [a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, a[3] + (b[3] - a[3]) * f];
+      }
+    }
+    var l = p[p.length - 1]; return [l[1], l[2], l[3]];
+  }
+
+  // ---------- recolour the data image into the offscreen canvas ----------
+  function recolour() {
+    if (!grey) return;
+    var lut = new Uint32Array(256), span = (cmax - cmin) || 1;
+    var little = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+    for (var v = 0; v < 256; v++) {
+      var db = meta.db_offset + v * meta.db_step;
+      var t = Math.max(0, Math.min(1, (db - cmin) / span));
+      var c = cmapRGB(cmapName, t), r = Math.round(c[0] * 255), g = Math.round(c[1] * 255), b = Math.round(c[2] * 255);
+      lut[v] = little ? ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0 : ((r << 24) | (g << 16) | (b << 8) | 255) >>> 0;
+    }
+    curLut = lut; pooled = null;              // pooled view must be rebuilt with the new colours
+    var img = offCtx.createImageData(cols, rows), out = new Uint32Array(img.data.buffer);
+    for (var i = 0, n = grey.length; i < n; i++) out[i] = lut[grey[i]];
+    offCtx.putImageData(img, 0, 0);
+    draw();
+  }
+
+  // When zoomed out (more data rows/cols than screen pixels), the browser would
+  // average neighbouring rows and wash out narrow signals. Instead build a
+  // max-pooled copy (like the original waterfall) for the current zoom factor.
+  var curLut = null, pooled = null;
+  function viewSource() {
+    var fx = Math.max(1, Math.floor(1 / sx)), fy = Math.max(1, Math.floor(1 / sy));
+    if (fx === 1 && fy === 1) return { c: off, fx: 1, fy: 1 };
+    if (pooled && pooled.fx === fx && pooled.fy === fy) return pooled;
+    var pw = Math.ceil(cols / fx), ph = Math.ceil(rows / fy);
+    var c = document.createElement("canvas"); c.width = pw; c.height = ph;
+    var cx3 = c.getContext("2d"), img = cx3.createImageData(pw, ph), out = new Uint32Array(img.data.buffer);
+    for (var py = 0; py < ph; py++) {
+      var ra = py * fy, rb = Math.min(rows, ra + fy);
+      for (var px = 0; px < pw; px++) {
+        var ca = px * fx, cb = Math.min(cols, ca + fx), m = 0;
+        for (var rr = ra; rr < rb; rr++) { var base = rr * cols; for (var cc = ca; cc < cb; cc++) { var v = grey[base + cc]; if (v > m) m = v; } }
+        out[py * pw + px] = curLut[m];
+      }
+    }
+    cx3.putImageData(img, 0, 0);
+    pooled = { c: c, fx: fx, fy: fy };
+    return pooled;
+  }
+
+  // ---------- geometry ----------
+  function wfRect() { return { x: AX_L, y: PAD_T + SPEC_H + GAP, w: W - AX_L - PAD_R, h: H - (PAD_T + SPEC_H + GAP) - AX_B }; }
+  function specRect() { return { x: AX_L, y: PAD_T, w: W - AX_L - PAD_R, h: SPEC_H }; }
+
+  function fit() {
+    if (!grey) return;
+    var r = wfRect();
+    sx = r.w / cols; sy = r.h / rows; tx = 0; ty = 0; fitted = true; draw();
+  }
+  function clampView() {
+    var r = wfRect();
+    var minSx = r.w / cols * 0.5, minSy = r.h / rows * 0.5;
+    sx = Math.max(minSx, Math.min(sx, 40)); sy = Math.max(minSy, Math.min(sy, 40));
+  }
+  function zoomAt(fx, fy, px, py) {         // px,py in waterfall-local px
+    var nsx = sx * fx, nsy = sy * fy, osx = sx, osy = sy;
+    sx = nsx; sy = nsy; clampView();
+    tx = px - (px - tx) * (sx / osx); ty = py - (py - ty) * (sy / osy);
+    fitted = false; draw();
+  }
+
+  function freqAtCol(c) { return meta.freq_lo_hz + (c + 0.5) * (meta.freq_hi_hz - meta.freq_lo_hz) / cols; }
+  function colAtFreq(f) { return (f - meta.freq_lo_hz) / (meta.freq_hi_hz - meta.freq_lo_hz) * cols; }
+
+  // ---------- drawing ----------
+  function draw() { if (!raf) raf = requestAnimationFrame(function () { raf = 0; paint(); }); }
+
+  function niceStep(span, target) {
+    var raw = span / target, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p;
+    return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+  }
+
+  function paint() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#111418"; ctx.fillRect(0, 0, W, H);
+    if (!grey) return;
+    var r = wfRect(), s = specRect();
+
+    // waterfall
+    ctx.save(); ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+    var src = viewSource();
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(src.c, r.x + tx, r.y + ty, src.c.width * src.fx * sx, src.c.height * src.fy * sy);
+    ctx.restore();
+    ctx.strokeStyle = "#3a434e"; ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + .5, r.y + .5, r.w - 1, r.h - 1);
+
+    // visible columns / rows
+    var c0 = Math.max(0, Math.floor(-tx / sx)), c1 = Math.min(cols - 1, Math.ceil((r.w - tx) / sx));
+    var r0 = Math.max(0, Math.floor(-ty / sy)), r1 = Math.min(rows - 1, Math.ceil((r.h - ty) / sy));
+
+    // frequency axis (shared)
+    ctx.fillStyle = "#c5ccd4"; ctx.font = "11px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+    var fL = freqAtCol(-tx / sx - 0.5), fR = freqAtCol((r.w - tx) / sx - 0.5);
+    var st = niceStep((fR - fL) / 1e6, Math.max(2, r.w / 90)) * 1e6, dec = Math.max(0, -Math.floor(Math.log10(st / 1e6) + 1e-9));
+    for (var f = Math.ceil(fL / st) * st; f <= fR; f += st) {
+      var x = r.x + tx + colAtFreq(f) * sx;
+      if (x < r.x || x > r.x + r.w) continue;
+      if (x < r.x + r.w - 40) { ctx.fillText((f / 1e6).toFixed(dec), x, r.y + r.h + 4);      // bottom axis
+        ctx.fillText((f / 1e6).toFixed(dec), x, s.y + s.h + 3); }   // top axis, between spectrum and waterfall
+      ctx.strokeStyle = "rgba(255,255,255,.08)";
+      ctx.beginPath(); ctx.moveTo(x + .5, s.y); ctx.lineTo(x + .5, s.y + s.h); ctx.stroke();
+    }
+    ctx.textAlign = "right"; ctx.fillStyle = "#8a939e"; ctx.fillText("MHz", W - PAD_R, r.y + r.h + 4);
+
+    // time axis
+    ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillStyle = "#c5ccd4";
+    var every = Math.max(1, Math.round(28 / sy)), lastY = -1e9;
+    var rStart = Math.ceil(r0 / every) * every;
+    for (var row = rStart; row <= r1; row += every) {
+      var y = r.y + ty + (row + 0.5) * sy;
+      if (y < r.y + 6 || y > r.y + r.h - 6 || y - lastY < 24) continue;
+      // show seconds when labels are less than a minute apart (avoids "16:23, 16:23")
+      var t = meta.times[row] || "", tn = meta.times[Math.min(rows - 1, row + every)] || t;
+      var gapS = Math.abs((Date.parse(t) - Date.parse(tn)) / 1000) || 60;
+      ctx.fillText(gapS < 60 ? t.slice(11, 19) : t.slice(11, 16), r.x - 6, y);
+      var d = t.slice(5, 10);
+      if (row === rStart) { ctx.fillStyle = "#8a939e"; ctx.fillText(d.slice(3) + "/" + d.slice(0, 2), r.x - 6, y + 12); ctx.fillStyle = "#c5ccd4"; }
+      lastY = y;
+    }
+
+    // spectrum panel: mean over visible rows (+ hovered row)
+    ctx.strokeStyle = "#3a434e"; ctx.strokeRect(s.x + .5, s.y + .5, s.w - 1, s.h - 1);
+    var nC = c1 - c0 + 1;
+    if (nC > 1 && r1 >= r0) {
+      var mean = new Float32Array(nC), cnt = r1 - r0 + 1;
+      for (var rr = r0; rr <= r1; rr++) { var base = rr * cols + c0; for (var k = 0; k < nC; k++) mean[k] += grey[base + k]; }
+      var lo = 1e9, hi = -1e9;
+      for (k = 0; k < nC; k++) { mean[k] = meta.db_offset + mean[k] / cnt * meta.db_step; if (mean[k] < lo) lo = mean[k]; if (mean[k] > hi) hi = mean[k]; }
+      var hrow = null;
+      if (hover && hover.row >= 0 && hover.row < rows) {
+        hrow = new Float32Array(nC); var hb = hover.row * cols + c0;
+        for (k = 0; k < nC; k++) { hrow[k] = meta.db_offset + grey[hb + k] * meta.db_step; if (hrow[k] > hi) hi = hrow[k]; if (hrow[k] < lo) lo = hrow[k]; }
+      }
+      lo = Math.min(lo, cmin); hi = Math.max(hi, cmax) + 2;
+      var ys = function (db) { return s.y + s.h - 4 - (db - lo) / (hi - lo) * (s.h - 8); };
+      var line = function (arr, col) {
+        ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.beginPath();
+        for (var k2 = 0; k2 < nC; k2++) { var xx = s.x + tx + (c0 + k2 + 0.5) * sx, yy = ys(arr[k2]); if (k2) ctx.lineTo(xx, yy); else ctx.moveTo(xx, yy); }
+        ctx.stroke();
+      };
+      ctx.save(); ctx.beginPath(); ctx.rect(s.x, s.y, s.w, s.h); ctx.clip();
+      ctx.setLineDash([3, 3]); ctx.strokeStyle = "rgba(255,255,255,.25)";
+      [cmin, cmax].forEach(function (lv) { var yy = ys(lv) + .5; ctx.beginPath(); ctx.moveTo(s.x, yy); ctx.lineTo(s.x + s.w, yy); ctx.stroke(); });
+      ctx.setLineDash([]);
+      line(mean, "#4da3ff");
+      if (hrow) line(hrow, "#ffb347");
+      ctx.restore();
+      ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillStyle = "#8a939e";
+      var dst = niceStep(hi - lo, 4);
+      for (var lv = Math.ceil(lo / dst) * dst; lv <= hi; lv += dst) ctx.fillText(lv.toFixed(0), s.x - 6, ys(lv));
+      ctx.save(); ctx.translate(12, s.y + s.h / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = "center";
+      ctx.fillText("dB", 0, 0); ctx.restore();
+      ctx.textAlign = "left"; ctx.textBaseline = "top"; ctx.fillStyle = "#4da3ff";
+      ctx.fillText("mean of visible rows", s.x + 6, s.y + 4);
+      if (hrow) { ctx.fillStyle = "#ffb347"; ctx.fillText("row " + (meta.times[hover.row] || "").slice(11, 19), s.x + 140, s.y + 4); }
+    }
+
+    // crosshair
+    if (hover && hover.inWf) {
+      ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(hover.x + .5, s.y); ctx.lineTo(hover.x + .5, r.y + r.h);
+      ctx.moveTo(r.x, hover.y + .5); ctx.lineTo(r.x + r.w, hover.y + .5); ctx.stroke();
+    }
+  }
+
+  // ---------- hover readout ----------
+  function updateHover(clientX, clientY) {
+    if (!grey) return;
+    var b = cv.getBoundingClientRect(), x = clientX - b.left, y = clientY - b.top, r = wfRect();
+    var inWf = x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+    var inSpec = x >= r.x && x <= r.x + r.w && y >= PAD_T && y <= PAD_T + SPEC_H;
+    if (!inWf && !inSpec) { hover = null; readout.textContent = ""; draw(); return; }
+    var col = Math.floor((x - r.x - tx) / sx), row = inWf ? Math.floor((y - r.y - ty) / sy) : (hover ? hover.row : -1);
+    hover = { x: x, y: y, col: col, row: row, inWf: inWf };
+    if (col >= 0 && col < cols) {
+      var txt = (freqAtCol(col) / 1e6).toFixed(4) + " MHz";
+      if (inWf && row >= 0 && row < rows) {
+        var db = meta.db_offset + grey[row * cols + col] * meta.db_step;
+        txt += "  ·  " + (meta.times[row] || "").replace("T", " ") + "  ·  " + db.toFixed(1) + " dB";
+      }
+      readout.textContent = txt;
+    } else readout.textContent = "";
+    draw();
+  }
+
+  // ---------- controls ----------
+  function setLevels(a, b, save) {
+    cmin = Math.min(a, b - 0.5); cmax = Math.max(b, cmin + 0.5);
+    el("cmin").value = cmin; el("cminN").value = cmin.toFixed(1);
+    el("cmax").value = cmax; el("cmaxN").value = cmax.toFixed(1);
+    if (save) { sset("cmin", cmin); sset("cmax", cmax); }
+    recolour();
+  }
+  function setupRanges() {
+    var lo = Math.floor(meta.db_offset), hi = Math.ceil(meta.db_offset + 255 * meta.db_step);
+    ["cmin", "cmax"].forEach(function (id) { var s = el(id); s.min = lo; s.max = hi; s.step = 0.5; el(id + "N").min = lo; el(id + "N").max = hi; });
+  }
+  el("cmin").addEventListener("input", function () { setLevels(+this.value, cmax, true); });
+  el("cmax").addEventListener("input", function () { setLevels(cmin, +this.value, true); });
+  el("cminN").addEventListener("change", function () { setLevels(+this.value, cmax, true); });
+  el("cmaxN").addEventListener("change", function () { setLevels(cmin, +this.value, true); });
+  el("cmap").addEventListener("change", function () { cmapName = this.value; sset("cmap", cmapName); recolour(); });
+  el("auto").onclick = function () { setLevels(meta.default_cmin, meta.default_cmax, true); };
+  el("fit").onclick = fit;
+  el("reload").onclick = function () { load(true); };
+
+  // ---------- pointer: pan, wheel zoom, pinch, double-tap ----------
+  var pointers = new Map(), last = null, pinch = null, lastTap = 0;
+  cv.addEventListener("wheel", function (e) {
+    e.preventDefault(); if (!grey) return;
+    var b = cv.getBoundingClientRect(), r = wfRect(), f = Math.exp(-e.deltaY * 0.0015);
+    var px = e.clientX - b.left - r.x, py = e.clientY - b.top - r.y;
+    if (e.shiftKey) zoomAt(f, 1, px, py);        // frequency only
+    else if (e.altKey) zoomAt(1, f, px, py);     // time only
+    else zoomAt(f, f, px, py);
+    updateHover(e.clientX, e.clientY);
+  }, { passive: false });
+  cv.addEventListener("pointerdown", function (e) {
+    cv.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) {
+      last = { x: e.clientX, y: e.clientY };
+      var now = Date.now();
+      if (now - lastTap < 300) { fit(); lastTap = 0; } else lastTap = now;
+    } else if (pointers.size === 2) {
+      var p = Array.from(pointers.values());
+      pinch = { dx: Math.abs(p[0].x - p[1].x), dy: Math.abs(p[0].y - p[1].y), cx: (p[0].x + p[1].x) / 2, cy: (p[0].y + p[1].y) / 2 };
+    }
+  });
+  cv.addEventListener("pointermove", function (e) {
+    if (e.pointerType === "mouse" && pointers.size === 0) { updateHover(e.clientX, e.clientY); return; }
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    var b = cv.getBoundingClientRect(), r = wfRect();
+    if (pointers.size === 2 && pinch) {
+      var p = Array.from(pointers.values());
+      var dx = Math.abs(p[0].x - p[1].x), dy = Math.abs(p[0].y - p[1].y), cx = (p[0].x + p[1].x) / 2, cy = (p[0].y + p[1].y) / 2;
+      tx += cx - pinch.cx; ty += cy - pinch.cy;
+      var d0 = Math.hypot(pinch.dx, pinch.dy), d1 = Math.hypot(dx, dy);
+      if (d0 > 10) zoomAt(d1 / d0, d1 / d0, cx - b.left - r.x, cy - b.top - r.y);
+      pinch = { dx: dx, dy: dy, cx: cx, cy: cy }; fitted = false; draw();
+    } else if (pointers.size === 1 && last) {
+      tx += e.clientX - last.x; ty += e.clientY - last.y; last = { x: e.clientX, y: e.clientY };
+      fitted = false; updateHover(e.clientX, e.clientY);
+    }
+  });
+  function up(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 1) { var p = Array.from(pointers.values())[0]; last = { x: p.x, y: p.y }; }
+    if (pointers.size === 0) last = null;
+  }
+  cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
+  cv.addEventListener("pointerleave", function () { if (pointers.size === 0) { hover = null; readout.textContent = ""; draw(); } });
+  document.addEventListener("keydown", function (e) {
+    if (e.target.tagName === "INPUT") return;
+    var r = wfRect();
+    if (e.key === "f" || e.key === "0") fit();
+    else if (e.key === "+" || e.key === "=") zoomAt(1.25, 1.25, r.w / 2, r.h / 2);
+    else if (e.key === "-") zoomAt(0.8, 0.8, r.w / 2, r.h / 2);
+  });
+
+  // ---------- size ----------
+  function resize() {
+    dpr = window.devicePixelRatio || 1; W = wrap.clientWidth; H = wrap.clientHeight;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    if (fitted) fit(); else draw();
+  }
+  window.addEventListener("resize", resize);
+
+  // ---------- loading ----------
+  function load(manual) {
+    fetch(META_URL + "?t=" + Date.now(), { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (m) {
+        if (meta && !manual && m.generated === meta.generated) { stamp(); return; }
+        var im = new Image();
+        im.onload = function () {
+          var c = document.createElement("canvas"); c.width = im.naturalWidth; c.height = im.naturalHeight;
+          var cx2 = c.getContext("2d", { willReadFrequently: true }); cx2.drawImage(im, 0, 0);
+          var d = cx2.getImageData(0, 0, c.width, c.height).data, g = new Uint8Array(c.width * c.height);
+          for (var i = 0, j = 0; i < g.length; i++, j += 4) g[i] = d[j];
+          var first = !meta;
+          meta = m; grey = g; cols = c.width; rows = c.height;
+          off.width = cols; off.height = rows;
+          el("title").textContent = (m.station || "Skymonitor") + " skymonitor";
+          setupRanges();
+          if (first) {
+            var sc = parseFloat(sget("cmin")), sm = parseFloat(sget("cmax")), cm = sget("cmap");
+            if (cm && CMAPS[cm]) { cmapName = cm; el("cmap").value = cm; }
+            setLevels(isFinite(sc) ? sc : m.default_cmin, isFinite(sm) ? sm : m.default_cmax, false);
+            msg.style.display = "none"; resize();
+          } else { recolour(); if (fitted) fit(); }
+          stamp();
+        };
+        im.onerror = function () { info.textContent = "could not load " + m.image; };
+        im.src = m.image + "?t=" + encodeURIComponent(m.generated || Date.now());
+      })
+      .catch(function (err) {
+        if (!meta) { msg.innerHTML = "No interactive data found (" + META_URL + ": " + err.message + ").<br>" +
+                     "<a style='color:#4da3ff' href='index.html'>Open the plain image viewer</a>"; }
+        info.textContent = "update failed, retrying later";
+      });
+  }
+  function stamp() {
+    var g = meta && meta.times && meta.times.length ? meta.times[0].replace("T", " ").slice(5, 16) : "";
+    info.textContent = "data up to " + g + " · checked " +
+      new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  resize(); load(false); setInterval(function () { load(false); }, REFRESH_MS);
+})();
+</script>
+</body>
+</html>
