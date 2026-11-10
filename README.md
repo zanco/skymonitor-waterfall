@@ -18,7 +18,7 @@ code). Features:
 * frequency axis above and below the waterfall
 * history viewer: span 8 h / 24 h / 2 days / 3 days, midnight lines,
   arrow keys and PgUp/PgDn to scroll through time, **peak/mean** choice for zoomed-out views
-
+![24 hours of the 400–406 MHz band](24-hrs-example.png)
 ## How it works
 
 ```
