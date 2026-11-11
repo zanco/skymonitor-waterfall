@@ -44,7 +44,7 @@ the browser can recolour and rescale them instantly without new downloads.
 ## Setup
 
 ```
-git clone https://github.com/<you>/skymonitor-waterfall.git ~/skymonitor-waterfall
+git clone https://github.com/zanco/skymonitor-waterfall.git ~/skymonitor-waterfall
 cd ~/skymonitor-waterfall
 cp config.example.sh config.sh      # then edit config.sh
 chmod +x *.sh
