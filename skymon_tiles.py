@@ -16,7 +16,7 @@ the numbers, so a run normally only parses the current hour.
 Each PNG that was (re)written is printed as "CHANGED <name>" for the upload script.
 
 Usage:
-  python3 skymon_tiles.py --csv-dir ~/skymon_csv --out-dir ~/skymon_web --days 3
+  python3 skymon_tiles.py --csv-dir /mnt/stvid/skymon_csv --out-dir /mnt/stvid/skymon_web --days 3
 """
 import argparse
 import csv
@@ -177,7 +177,17 @@ def build_index(args, tiles_dir, now):
     sides.sort(key=lambda x: x[0], reverse=True)    # newest first
     if not sides:
         return None
-    ref = sides[0][1]
+    # Reference layout = the one with the most rows over all tiles, not simply the newest tile:
+    # right after the hour change the new tile may hold only one half-written sweep with a
+    # narrower frequency range, and taking that as reference would throw out every other hour.
+    # A real change of range/scale still wins once its tiles hold more rows than the old ones.
+    def layout(s):
+        return (s["cols"], round(s["freq_lo_hz"]), round(s["freq_hi_hz"]), s["db_offset"], s["db_step"])
+    weight = {}
+    for hs, s in sides:
+        weight[layout(s)] = weight.get(layout(s), 0) + s.get("rows", 0)
+    ref_layout = max(weight, key=weight.get)
+    ref = next(s for hs, s in sides if layout(s) == ref_layout)
     keep = []
     for hs, s in sides:
         if s["cols"] != ref["cols"] or abs(s["freq_lo_hz"] - ref["freq_lo_hz"]) > 1 \
@@ -211,12 +221,12 @@ def build_index(args, tiles_dir, now):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv-dir", default=os.path.expanduser("~/skymon_csv"), help="folder with rtl_power_YYYY-MM-DD.csv")
-    ap.add_argument("--out-dir", default=os.path.expanduser("~/skymon_web"), help="tiles/ and skymon_index.json go here")
+    ap.add_argument("--csv-dir", default="/mnt/stvid/skymon_csv", help="folder with rtl_power_YYYY-MM-DD.csv")
+    ap.add_argument("--out-dir", default="/mnt/stvid/skymon_web", help="tiles/ and skymon_index.json go here")
     ap.add_argument("--days", type=float, default=3.0, help="days of history in the index (default 3)")
     ap.add_argument("--offset", type=float, default=-50.0, help="dB of grey level 0, same for all tiles (default -50)")
     ap.add_argument("--step", type=float, default=0.25, help="dB per grey level (default 0.25 -> -50 .. +13.75 dB)")
-    ap.add_argument("--station", default="STATION", help="label shown in the viewer")
+    ap.add_argument("--station", default="PE2BZ", help="label shown in the viewer")
     ap.add_argument("--cmin", type=float, default=None, help="default CMIN shown in viewer")
     ap.add_argument("--cmax", type=float, default=None, help="default CMAX shown in viewer")
     args = ap.parse_args()
