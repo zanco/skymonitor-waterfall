@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Skymonitor history</title>
+<title>PE2BZ Skymonitor history</title>
 <style>
   :root { --bg:#111418; --bar:#1c2128; --fg:#d8dde3; --dim:#8a939e; --btn:#2a313a; --btnh:#38414c; --acc:#4da3ff; }
   html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
@@ -46,6 +46,7 @@
     <button id="auto" title="Levels from the data: noise floor − 4 dB … 99.9% + 2 dB">Auto</button>
     <button id="fit" title="Show everything (double-click / double-tap)">Fit</button>
     <button id="reload" title="Load the latest data now">Reload</button>
+    <button id="switch" title="Switch back to the live 8-hour waterfall" onclick="location.href='waterfall.html'">Live 8 h</button>
   </div>
   <span id="readout"></span>
   <span id="info">loading…</span>
@@ -260,22 +261,33 @@
     }
     ctx.textAlign = "right"; ctx.fillStyle = "#8a939e"; ctx.fillText("MHz", W - PAD_R, r.y + r.h + 4);
 
-    // time axis (date shown under the first label and wherever the day changes)
-    ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillStyle = "#c5ccd4";
-    var every = Math.max(1, Math.round(28 / sy)), lastY = -1e9, lastDay = "";
-    var rStart = Math.ceil(r0 / every) * every;
-    for (var row = rStart; row <= r1; row += every) {
-      var y = r.y + ty + (row + 0.5) * sy;
+    // time axis: labels on round times (whole hours when zoomed out, minutes when zoomed in),
+    // the newest visible time at the top edge, the date under it and at every midnight
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    var tm = meta.tmin, spanMin = Math.max(1, tm[0] - tm[rows - 1]), rpm = rows / spanMin;
+    var STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440], stepM = 1440;
+    for (var si = 0; si < STEPS.length; si++) if (STEPS[si] * rpm * sy >= 26) { stepM = STEPS[si]; break; }
+    var hhmm = function (m) { var d = new Date(m * 60000); return pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes()); };
+    var ddmm = function (m) { var d = new Date(m * 60000); return pad(d.getUTCDate()) + "/" + pad(d.getUTCMonth() + 1); };
+    var topRow = Math.max(r0, Math.min(r1, Math.floor(-ty / sy)));
+    var yTop = r.y + 7;
+    ctx.fillStyle = "#4da3ff"; ctx.fillText(hhmm(tm[topRow]), r.x - 6, yTop);
+    ctx.fillStyle = "#8a939e"; ctx.fillText(ddmm(tm[topRow]), r.x - 6, yTop + 12);
+    var lastY = yTop + 12;
+    ctx.fillStyle = "#c5ccd4"; ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 1;
+    for (var row = topRow; row < r1; row++) {
+      var bNew = Math.floor(tm[row] / stepM), bOld = Math.floor(tm[row + 1] / stepM);
+      if (bNew === bOld) continue;
+      var bm = bNew * stepM;                                   // round time between these two rows
+      var frac = (tm[row] - bm) / ((tm[row] - tm[row + 1]) || 1);
+      var y = r.y + ty + (row + 0.5 + frac) * sy;
       if (y < r.y + 6 || y > r.y + r.h - 6 || y - lastY < 24) continue;
-      var t = meta.times[row] || "", tn = meta.times[Math.min(rows - 1, row + every)] || t;
-      var gapS = Math.abs((Date.parse(t) - Date.parse(tn)) / 1000) || 60;
-      ctx.fillText(gapS < 60 ? t.slice(11, 19) : t.slice(11, 16), r.x - 6, y);
-      var d = t.slice(0, 10);
-      if (d !== lastDay) {
-        ctx.fillStyle = "#8a939e"; ctx.fillText(d.slice(8, 10) + "/" + d.slice(5, 7), r.x - 6, y + 12); ctx.fillStyle = "#c5ccd4";
-        lastDay = d;
-      }
-      lastY = y;
+      ctx.fillText(hhmm(bm), r.x - 6, y);
+      ctx.beginPath(); ctx.moveTo(r.x - 4, Math.round(y) + .5); ctx.lineTo(r.x, Math.round(y) + .5); ctx.stroke();
+      if (bm % 1440 === 0) {                                   // midnight: date of the day that starts here
+        ctx.fillStyle = "#8a939e"; ctx.fillText(ddmm(bm), r.x - 6, y + 12); ctx.fillStyle = "#c5ccd4";
+        lastY = y + 12;
+      } else lastY = y;
     }
 
     // spectrum panel: mean over visible rows (+ hovered row)
@@ -483,6 +495,7 @@
     meta = { station: ix.station, freq_lo_hz: ix.freq_lo_hz, freq_hi_hz: ix.freq_hi_hz,
              db_offset: ix.db_offset, db_step: ix.db_step, default_cmin: ix.default_cmin, default_cmax: ix.default_cmax,
              times: times, generated: ix.generated, hours: parts.length, missing: want.length - parts.length };
+    meta.tmin = times.map(function (x) { return Date.parse(x + "Z") / 60000; });   // minutes, station wall-clock
     grey = g; cols = ix.cols; rows = total;
     dayBreaks = [];
     for (var i = 1; i < rows; i++) if (times[i].slice(0, 10) !== times[i - 1].slice(0, 10)) dayBreaks.push(i);
